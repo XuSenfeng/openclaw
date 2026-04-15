@@ -1,0 +1,17 @@
+{
+  "id": "python-platform",
+  "name": "Python Virtual Platform",
+  "description": "Connects to a Python Virtual Platform via WebSocket",
+  "channel": "python-platform",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "wsUrl": {
+        "type": "string",
+        "default": "ws://127.0.0.1:8765",
+        "description": "WebSocket URL of the Python platform server"
+      }
+    }
+  }
+}
