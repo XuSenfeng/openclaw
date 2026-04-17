@@ -3,17 +3,9 @@ import { attachChannelToResult } from "openclaw/plugin-sdk/channel-send-result";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { createStandardChannelSetupStatus } from "openclaw/plugin-sdk/setup";
-// @ts-ignore - Internal import for registry state symbol
-import { PLUGIN_REGISTRY_STATE } from "../../src/plugins/runtime-state.js";
-// @ts-ignore - Internal import for subagent mode check
-import { getActivePluginRuntimeSubagentMode } from "../../src/plugins/runtime.js";
 // @ts-ignore - Internal import for global singleton
 import { resolveGlobalSingleton } from "../../src/shared/global-singleton.js";
 import { withPluginRuntimeGatewayRequestScope } from "./gateway-request-scope.js";
-
-const GATEWAY_SUBAGENT_SYMBOL: unique symbol = Symbol.for(
-  "openclaw.plugin.gatewaySubagentRuntime",
-) as unknown as typeof GATEWAY_SUBAGENT_SYMBOL;
 
 const FALLBACK_GATEWAY_CONTEXT_STATE_KEY: unique symbol = Symbol.for(
   "openclaw.fallbackGatewayContextState",
@@ -28,27 +20,6 @@ type PythonPlatformRuntimeState = {
   activeConversationByUser: Map<string, string>;
   conversationTurnsBySession: Map<string, Array<{ role: "user" | "assistant"; content: string }>>;
 };
-
-function getGatewaySubagentRuntime() {
-  const state = resolveGlobalSingleton<{ subagent: unknown }>(GATEWAY_SUBAGENT_SYMBOL, () => ({
-    subagent: undefined,
-  }));
-  return state.subagent as { run: (opts: unknown) => Promise<unknown> } | undefined;
-}
-
-function forceGatewaySubagentBinding() {
-  try {
-    const globalState = globalThis as Record<string, unknown>;
-    const state = globalState[PLUGIN_REGISTRY_STATE as unknown as string] as {
-      runtimeSubagentMode: string;
-    };
-    if (state && state.runtimeSubagentMode !== "gateway-bindable") {
-      state.runtimeSubagentMode = "gateway-bindable";
-    }
-  } catch {
-    // Ignore errors
-  }
-}
 
 function getFallbackGatewayContext() {
   const state = resolveGlobalSingleton<Record<string, unknown>>(
@@ -216,9 +187,6 @@ export default definePluginEntry({
               return;
             }
 
-            // 强制开启子代理绑定模式
-            forceGatewaySubagentBinding();
-
             const sessionKey = `python-platform:${userId}:${conversationId}`;
             const fallbackContext = getFallbackGatewayContext();
             const messageForRun = buildMessageWithConversationContext(sessionKey, content);
@@ -264,11 +232,6 @@ export default definePluginEntry({
             }
 
             try {
-              // Log subagent mode for debugging
-              api.logger.info(
-                `[python-platform] Active subagent mode: ${getActivePluginRuntimeSubagentMode()}`,
-              );
-
               // Use withPluginRuntimeGatewayRequestScope to bypass "only available during a gateway request" error
               await withPluginRuntimeGatewayRequestScope(
                 {
@@ -284,7 +247,6 @@ export default definePluginEntry({
                     internal: {
                       allowModelOverride: true,
                     },
-                    // 明确提供必要的作用域以执行子代理 (Subagent)
                     scopes: [
                       "operator.write",
                       "operator.read",
@@ -301,42 +263,175 @@ export default definePluginEntry({
                   pluginId: "python-platform",
                 },
                 async () => {
-                  // IMPORTANT: Directly access the subagent from the global singleton
-                  // This bypasses the api.runtime.subagent proxy which checks allowGatewaySubagentBinding
-                  // that might have been false during plugin initialization.
-                  const subagent =
-                    getGatewaySubagentRuntime() ||
-                    (
-                      api.runtime as unknown as {
-                        subagent: { run: (opts: unknown) => Promise<unknown> };
-                      }
-                    ).subagent;
+                  const runtime = api.runtime as unknown as {
+                    channel: {
+                      reply: {
+                        finalizeInboundContext: (
+                          ctx: Record<string, unknown>,
+                        ) => Record<string, unknown>;
+                        dispatchReplyWithBufferedBlockDispatcher: (params: {
+                          ctx: Record<string, unknown>;
+                          cfg: unknown;
+                          dispatcherOptions: {
+                            deliver: (
+                              payload: { text?: string },
+                              info: { kind: "tool" | "block" | "final" },
+                            ) => Promise<void>;
+                          };
+                          replyOptions?: Record<string, unknown>;
+                        }) => Promise<unknown>;
+                      };
+                    };
+                  };
 
-                  if (!subagent) {
-                    throw new Error(
-                      "Subagent runtime not available. Ensure Gateway is initialized.",
+                  const streamId = `py-stream:${conversationId}:${
+                    messageId || `msg-${Date.now()}`
+                  }`;
+                  let streamedText = "";
+                  let finalized = false;
+                  let pendingFinalTimer: ReturnType<typeof setTimeout> | null = null;
+
+                  const sendStream = (params: {
+                    text: string;
+                    state: "delta" | "final";
+                    allowEmpty?: boolean;
+                    fullContent?: boolean;
+                  }) => {
+                    if (!ws || (ws as { readyState: number }).readyState !== 1) {
+                      return;
+                    }
+                    if (!params.allowEmpty && !params.text) {
+                      return;
+                    }
+                    (ws as { send: (data: string) => void }).send(
+                      JSON.stringify({
+                        type: "send_message",
+                        chat_id: conversationId,
+                        to_user_id: userId,
+                        content: params.text,
+                        client_message_id: messageId || undefined,
+                        stream_id: streamId,
+                        stream_state: params.state,
+                        stream_full_content: params.fullContent === true,
+                      }),
                     );
-                  }
+                  };
 
-                  // Using a more direct 'run' call if available, or ensuring we are in the correct async context
-                  const runResult = await (
-                    subagent as { run: (opts: unknown) => Promise<unknown> }
-                  ).run({
-                    sessionKey,
-                    message: messageForRun,
-                    deliver: true,
-                    channel: "python-platform",
-                    replyChannel: "python-platform",
-                    accountId: "default",
-                    replyAccountId: "default",
-                    to: userId,
-                    threadId: conversationId,
-                    // 使用 messageId 作为幂等键以便在 Dashboard 中合并显示
-                    idempotencyKey: messageId || `py-${userId}-${conversationId}-${Date.now()}`,
+                  const emitFinalIfNeeded = (finalText: string) => {
+                    if (finalized || !finalText.trim()) {
+                      return;
+                    }
+                    finalized = true;
+                    sendStream({
+                      text: finalText,
+                      state: "final",
+                      fullContent: true,
+                    });
+                    appendConversationTurn(sessionKey, "assistant", finalText);
+                  };
+
+                  const scheduleSyntheticFinal = () => {
+                    if (pendingFinalTimer) {
+                      clearTimeout(pendingFinalTimer);
+                    }
+                    pendingFinalTimer = setTimeout(() => {
+                      emitFinalIfNeeded(streamedText);
+                    }, 450);
+                  };
+
+                  const inboundContext = runtime.channel.reply.finalizeInboundContext({
+                    Body: content,
+                    BodyForAgent: messageForRun,
+                    RawBody: content,
+                    CommandBody: content,
+                    SessionKey: sessionKey,
+                    AccountId: "default",
+                    MessageSid: messageId || `py-${userId}-${conversationId}-${Date.now()}`,
+                    MessageThreadId: conversationId,
+                    SenderId: userId,
+                    SenderName: userName,
+                    SenderUsername: userName,
+                    ChatType: "direct",
+                    CommandAuthorized: true,
+                    Provider: "python-platform",
+                    Surface: "python-platform",
+                    OriginatingChannel: "python-platform",
+                    OriginatingTo: userId,
                   });
-                  api.logger.info(
-                    `[python-platform] Subagent run started: ${JSON.stringify(runResult)}`,
-                  );
+
+                  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+                    ctx: inboundContext,
+                    cfg: api.config,
+                    dispatcherOptions: {
+                      deliver: async (
+                        payload: { text?: string },
+                        info: { kind: "tool" | "block" | "final" },
+                      ) => {
+                        if (info.kind === "tool") {
+                          return;
+                        }
+                        const rawText = typeof payload.text === "string" ? payload.text : "";
+                        const normalized = rawText;
+                        if (!normalized && info.kind !== "final") {
+                          return;
+                        }
+
+                        if (info.kind === "block") {
+                          const delta = normalized.startsWith(streamedText)
+                            ? normalized.slice(streamedText.length)
+                            : normalized;
+                          if (!delta) {
+                            return;
+                          }
+                          const chunkSize = 24;
+                          let start = 0;
+                          while (start < delta.length) {
+                            const end = Math.min(start + chunkSize, delta.length);
+                            const chunk = delta.substring(start, end);
+                            streamedText += chunk;
+                            sendStream({ text: chunk, state: "delta" });
+                            start = end;
+                          }
+                          scheduleSyntheticFinal();
+                          return;
+                        }
+
+                        if (pendingFinalTimer) {
+                          clearTimeout(pendingFinalTimer);
+                          pendingFinalTimer = null;
+                        }
+
+                        const hadBlockChunks = streamedText.length > 0;
+                        if (!hadBlockChunks && normalized.trim().length > 0) {
+                          // Fallback: if upstream returns only final text, simulate chunked deltas
+                          // so the mobile client can still render incremental output.
+                          const chunkSize = 24;
+                          let start = 0;
+                          while (start < normalized.length) {
+                            const end = Math.min(start + chunkSize, normalized.length);
+                            const chunk = normalized.substring(start, end);
+                            streamedText += chunk;
+                            sendStream({ text: chunk, state: "delta" });
+                            start = end;
+                          }
+                        } else {
+                          const finalDelta = normalized.startsWith(streamedText)
+                            ? normalized.slice(streamedText.length)
+                            : normalized;
+                          if (finalDelta) {
+                            streamedText += finalDelta;
+                          }
+                        }
+
+                        const finalText = streamedText || normalized;
+                        emitFinalIfNeeded(finalText);
+                      },
+                    },
+                    replyOptions: {
+                      disableBlockStreaming: false,
+                      idempotencyKey: messageId || `py-${userId}-${conversationId}-${Date.now()}`,
+                    },
+                  });
                 },
               );
             } catch (err: unknown) {
