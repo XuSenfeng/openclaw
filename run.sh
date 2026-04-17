@@ -1,0 +1,1 @@
+node openclaw.mjs gateway run --port 18888 --force --verbose
