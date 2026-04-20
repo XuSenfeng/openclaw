@@ -59,6 +59,7 @@ export default definePluginEntry({
     let ws: { send: (data: string) => void; readyState: number } | null = null;
     let isConnecting = false;
     let wsUrl = "";
+    let serverId = "default";
     const runtimeState = getPythonPlatformRuntimeState();
     const processedMessageIds = runtimeState.processedMessageIds;
     const activeConversationByUser = runtimeState.activeConversationByUser;
@@ -128,6 +129,8 @@ export default definePluginEntry({
         ] as Record<string, unknown> | undefined;
         wsUrl =
           (config?.wsUrl as string) || process.env.PYTHON_PLATFORM_WS_URL || "ws://127.0.0.1:8765";
+        serverId =
+          (config?.serverId as string) || process.env.PYTHON_PLATFORM_SERVER_ID || "default";
 
         const WebSocket = (await import("ws")).default;
         api.logger.info(`[python-platform] Connecting to ${wsUrl}...`);
@@ -138,6 +141,19 @@ export default definePluginEntry({
         socket.on("open", () => {
           isConnecting = false;
           api.logger.info(`[python-platform] Connected to server at ${wsUrl}`);
+          try {
+            socket.send(
+              JSON.stringify({
+                type: "register",
+                role: "openclaw",
+                server_id: serverId,
+              }),
+            );
+            api.logger.info(`[python-platform] Registered as openclaw, server_id=${serverId}`);
+          } catch (e: unknown) {
+            const error = e as Error;
+            api.logger.error(`[python-platform] Register failed: ${error.message}`);
+          }
         });
 
         socket.on("message", async (data: unknown) => {
@@ -148,6 +164,13 @@ export default definePluginEntry({
           try {
             payload = JSON.parse(raw) as Record<string, unknown>;
           } catch {
+            return;
+          }
+
+          if (payload.type === "register_response") {
+            const role = typeof payload.role === "string" ? payload.role : "";
+            const paired = payload.paired === true;
+            api.logger.info(`[python-platform] register_response: role=${role}, paired=${paired}`);
             return;
           }
 
@@ -307,6 +330,7 @@ export default definePluginEntry({
                     (ws as { send: (data: string) => void }).send(
                       JSON.stringify({
                         type: "send_message",
+                        server_id: serverId,
                         chat_id: conversationId,
                         to_user_id: userId,
                         content: params.text,
@@ -558,6 +582,35 @@ export default definePluginEntry({
               },
             },
           ],
+          textInputs: [
+            {
+              inputKey: "serverId",
+              message: "Enter Server ID (must match mobile client)",
+              placeholder: "default",
+              currentValue: ({ cfg }: { cfg: unknown }) =>
+                ((cfg as Record<string, Record<string, Record<string, unknown>>>).channels?.[
+                  "python-platform"
+                ]?.serverId as string | undefined) || undefined,
+              normalizeValue: ({ value }: { value: string }) => {
+                const normalized = value.trim();
+                return normalized || "default";
+              },
+              shouldPrompt: () => true,
+              applySet: async ({ cfg, value }: { cfg: unknown; value: unknown }) => {
+                const patch = { serverId: String(value) };
+                const { patchTopLevelChannelConfigSection } =
+                  await import("openclaw/plugin-sdk/setup");
+                /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+                const cfgAny = cfg as any;
+                return patchTopLevelChannelConfigSection({
+                  cfg: cfgAny,
+                  channel: "python-platform",
+                  enabled: true,
+                  patch,
+                });
+              },
+            },
+          ],
           /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
         } as any,
         setup: async (_ctx: unknown) => {
@@ -592,6 +645,7 @@ export default definePluginEntry({
           (ws as { send: (data: string) => void }).send(
             JSON.stringify({
               type: "send_message",
+              server_id: serverId,
               chat_id: chatId,
               to_user_id: userId,
               content: content,
@@ -623,6 +677,7 @@ export default definePluginEntry({
           (ws as { send: (data: string) => void }).send(
             JSON.stringify({
               type: "send_message",
+              server_id: serverId,
               chat_id: threadId || "unknown",
               to_user_id: to,
               content: text,

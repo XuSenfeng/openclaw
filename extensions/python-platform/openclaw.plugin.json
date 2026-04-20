@@ -11,6 +11,11 @@
         "type": "string",
         "default": "ws://127.0.0.1:8765",
         "description": "WebSocket URL of the Python platform server"
+      },
+      "serverId": {
+        "type": "string",
+        "default": "default",
+        "description": "Logical server id for pairing with clients"
       }
     }
   }
