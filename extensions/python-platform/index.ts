@@ -290,6 +290,7 @@ export default definePluginEntry({
                   let streamedText = "";
                   let finalized = false;
                   let pendingFinalTimer: ReturnType<typeof setTimeout> | null = null;
+                  let toolHintSent = false;
 
                   const sendStream = (params: {
                     text: string;
@@ -339,6 +340,21 @@ export default definePluginEntry({
                     }, 450);
                   };
 
+                  const sendDeltaChunked = (text: string) => {
+                    if (!text) {
+                      return;
+                    }
+                    const chunkSize = 24;
+                    let start = 0;
+                    while (start < text.length) {
+                      const end = Math.min(start + chunkSize, text.length);
+                      const chunk = text.substring(start, end);
+                      streamedText += chunk;
+                      sendStream({ text: chunk, state: "delta" });
+                      start = end;
+                    }
+                  };
+
                   const inboundContext = runtime.channel.reply.finalizeInboundContext({
                     Body: content,
                     BodyForAgent: messageForRun,
@@ -367,11 +383,29 @@ export default definePluginEntry({
                         payload: { text?: string },
                         info: { kind: "tool" | "block" | "final" },
                       ) => {
-                        if (info.kind === "tool") {
-                          return;
-                        }
                         const rawText = typeof payload.text === "string" ? payload.text : "";
                         const normalized = rawText;
+
+                        if (info.kind === "tool") {
+                          if (normalized.trim().length > 0) {
+                            const delta = normalized.startsWith(streamedText)
+                              ? normalized.slice(streamedText.length)
+                              : normalized;
+                            if (delta) {
+                              sendDeltaChunked(delta);
+                              scheduleSyntheticFinal();
+                            }
+                            return;
+                          }
+                          if (!toolHintSent) {
+                            toolHintSent = true;
+                            const hint = "\n正在调用工具，请稍候...\n";
+                            sendDeltaChunked(hint);
+                            scheduleSyntheticFinal();
+                          }
+                          return;
+                        }
+
                         if (!normalized && info.kind !== "final") {
                           return;
                         }
@@ -383,15 +417,7 @@ export default definePluginEntry({
                           if (!delta) {
                             return;
                           }
-                          const chunkSize = 24;
-                          let start = 0;
-                          while (start < delta.length) {
-                            const end = Math.min(start + chunkSize, delta.length);
-                            const chunk = delta.substring(start, end);
-                            streamedText += chunk;
-                            sendStream({ text: chunk, state: "delta" });
-                            start = end;
-                          }
+                          sendDeltaChunked(delta);
                           scheduleSyntheticFinal();
                           return;
                         }
@@ -405,15 +431,7 @@ export default definePluginEntry({
                         if (!hadBlockChunks && normalized.trim().length > 0) {
                           // Fallback: if upstream returns only final text, simulate chunked deltas
                           // so the mobile client can still render incremental output.
-                          const chunkSize = 24;
-                          let start = 0;
-                          while (start < normalized.length) {
-                            const end = Math.min(start + chunkSize, normalized.length);
-                            const chunk = normalized.substring(start, end);
-                            streamedText += chunk;
-                            sendStream({ text: chunk, state: "delta" });
-                            start = end;
-                          }
+                          sendDeltaChunked(normalized);
                         } else {
                           const finalDelta = normalized.startsWith(streamedText)
                             ? normalized.slice(streamedText.length)
@@ -423,7 +441,7 @@ export default definePluginEntry({
                           }
                         }
 
-                        const finalText = streamedText || normalized;
+                        const finalText = streamedText || normalized || "暂未生成可展示文本";
                         emitFinalIfNeeded(finalText);
                       },
                     },
