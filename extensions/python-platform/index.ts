@@ -60,6 +60,44 @@ export default definePluginEntry({
     let isConnecting = false;
     let wsUrl = "";
     let serverId = "default";
+    let pairCodeRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+    const requestPairCode = () => {
+      if (!ws || (ws as { readyState: number }).readyState !== 1) {
+        return;
+      }
+      try {
+        (ws as { send: (data: string) => void }).send(
+          JSON.stringify({
+            type: "create_pair_code",
+            server_id: serverId,
+            ttl_seconds: 120,
+          }),
+        );
+      } catch (e) {
+        api.logger.error(`[python-platform] Failed to request pair code: ${(e as Error).message}`);
+      }
+    };
+
+    const startPairCodeRefresh = () => {
+      if (pairCodeRefreshTimer) {
+        clearInterval(pairCodeRefreshTimer);
+        pairCodeRefreshTimer = null;
+      }
+      requestPairCode();
+      // Refresh before expiration to keep a valid code continuously available.
+      pairCodeRefreshTimer = setInterval(() => {
+        requestPairCode();
+      }, 90_000);
+    };
+
+    const stopPairCodeRefresh = () => {
+      if (!pairCodeRefreshTimer) {
+        return;
+      }
+      clearInterval(pairCodeRefreshTimer);
+      pairCodeRefreshTimer = null;
+    };
     const runtimeState = getPythonPlatformRuntimeState();
     const processedMessageIds = runtimeState.processedMessageIds;
     const activeConversationByUser = runtimeState.activeConversationByUser;
@@ -171,6 +209,20 @@ export default definePluginEntry({
             const role = typeof payload.role === "string" ? payload.role : "";
             const paired = payload.paired === true;
             api.logger.info(`[python-platform] register_response: role=${role}, paired=${paired}`);
+            if (role === "openclaw" && ws && (ws as { readyState: number }).readyState === 1) {
+              startPairCodeRefresh();
+            }
+            return;
+          }
+
+          if (payload.type === "pair_code_created") {
+            const code = typeof payload.pair_code === "string" ? payload.pair_code : "";
+            const expiresAt = typeof payload.expires_at === "string" ? payload.expires_at : "";
+            if (code) {
+              api.logger.info(
+                `[python-platform] Pair code generated: ${code} (expires: ${expiresAt || "unknown"})`,
+              );
+            }
             return;
           }
 
@@ -489,6 +541,7 @@ export default definePluginEntry({
         socket.on("close", () => {
           isConnecting = false;
           ws = null;
+          stopPairCodeRefresh();
           api.logger.warn("[python-platform] Disconnected. Reconnecting in 5s...");
           setTimeout(() => {
             void connect();
@@ -497,6 +550,7 @@ export default definePluginEntry({
 
         socket.on("error", (e: unknown) => {
           isConnecting = false;
+          stopPairCodeRefresh();
           const error = e as { code?: string; message: string };
           if (error.code !== "ECONNREFUSED") {
             api.logger.error(`[python-platform] WS Error: ${error.message}`);
